@@ -1,8 +1,9 @@
 # devin-tokenviz
 
-A pure-Rust TUI that visualizes [Devin CLI](https://devin.ai) token usage and
-prices it out. It scans your local Devin CLI session transcripts and shows a
-token-distribution breakdown plus a per-model and per-session cost estimate.
+A pure-Rust CLI that visualizes [Devin CLI](https://devin.ai) token usage and
+prices it out. It scans your local Devin CLI session transcripts and prints a
+summary: token distribution by model, a cost estimate per model, and a usage
+timeline. One-shot output — no fullscreen TUI.
 
 ## Install
 
@@ -15,22 +16,45 @@ cargo install --git https://github.com/lexoliu/devin-tokenviz
 ## Usage
 
 ```sh
-devin-tokenviz                 # launch the TUI
-devin-tokenviz --print         # plain-text summary (no TUI)
-devin-tokenviz --days 7        # only the last 7 days
-devin-tokenviz --data-dir DIR  # custom transcripts directory
-devin-tokenviz --pricing FILE  # extra pricing rules (TOML)
+devin-tokenviz            # all recorded history (default: `all`)
+devin-tokenviz day        # last 24 hours, hourly timeline  (alias: 24h)
+devin-tokenviz week       # last 7 days, daily timeline
+devin-tokenviz month      # last 30 days, daily timeline
 ```
 
-Keys in the TUI: `q`/`Esc` quit · `↑↓`/`jk` select session · `g`/`G` top/bottom ·
-`s` cycle session sort (recent → cost → tokens → name) · `r` rescan transcripts.
+Global flags: `--data-dir DIR` (default `~/.local/share/devin/cli/transcripts`),
+`--pricing FILE` (extra pricing rules).
+
+Example output:
+
+```text
+devin-tokenviz · last 7 days · Sep 06 16:55 → Sep 12 02:30
+74 sessions · 3602 steps · 467M tokens
+input 15.3M · cached 449M · output 1.86M
+list (equiv.) $199.56   actual $79.89
+
+── by model ─────────────────────────────────────────────
+ MODEL        TOTAL  SHARE  PRICED AS            LIST    ACTUAL  DIST
+ SWE-2         158M  33.8%  kimi-k3 *           $83.18     $0.00  ████
+ SWE-1.7       155M  33.2%  kimi-k2.7-code *    $36.25     $0.00  ████
+ GPT-5.6 Sol   144M  31.0%  list                $66.18    $66.18  ███
+ ...
+ * free in Devin CLI — struck list price, actual $0.00
+
+── timeline ─────────────────────────────────────────────
+ Sep 09  ██████████████████████████████  218M  $82.57  $66.18
+ ...
+```
+
+Colors: cyan = input, gray = cached, yellow = output. Free models show their
+equivalent list price struck through with a green `$0.00`. ANSI styling is
+disabled when piping or when `NO_COLOR` is set.
 
 ## What it reads
 
-Session transcripts at `~/.local/share/devin/cli/transcripts/*.json`
-(`--data-dir` overrides). Each step records `prompt_tokens`,
-`completion_tokens`, and `cached_tokens` per model. `cached` is a subset of
-`prompt`, so uncached input is `prompt − cached`.
+Session transcripts at `~/.local/share/devin/cli/transcripts/*.json`. Each step
+records `prompt_tokens`, `completion_tokens`, and `cached_tokens` per model.
+`cached` is a subset of `prompt`, so uncached input is `prompt − cached`.
 
 ## Pricing
 
@@ -50,9 +74,9 @@ as of Sep 2026:
 | Kimi K3 / K2.7 | list | $3.00 / $0.95 | $0.30 / $0.19 | $15 / $4.00 |
 
 **Free models** (SWE-1.7, SWE-2, Adaptive, Fusion — Cognition's own models,
-which Devin CLI doesn't bill) are still priced at the equivalent public model
-they're based on: the list price is shown ~~struck through~~ and the actual
-charge as green `$0.00`. `Adaptive` is a router, so its rate is an estimate.
+which Devin CLI doesn't bill) are still priced at the public model they're
+equivalent to: the list price is shown struck through and the actual charge is
+a green `$0.00`. `Adaptive` is a router, so its rate is an estimate.
 
 Models with no matching rule show `?` and are excluded from cost totals.
 
@@ -80,4 +104,5 @@ unpriced.
 
 - Costs are estimates: cache-write premiums, long-context repricing, and
   batch/fast tiers are not modeled.
-- 100% Rust: ratatui + crossterm, serde_json, clap, chrono, toml.
+- 100% Rust: clap, serde_json, chrono, toml, terminal_size. No TUI framework —
+  output is plain text with optional ANSI styling.

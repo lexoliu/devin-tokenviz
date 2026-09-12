@@ -36,11 +36,6 @@ pub fn money(x: f64) -> String {
     format!("{}${grouped}.{frac:02}", if neg { "-" } else { "" })
 }
 
-/// Short local date "Sep 12".
-pub fn date(ts: chrono::DateTime<chrono::Utc>) -> String {
-    ts.with_timezone(&chrono::Local).format("%b %d").to_string()
-}
-
 /// "Sep 12 14:03" local time.
 pub fn datetime(ts: chrono::DateTime<chrono::Utc>) -> String {
     ts.with_timezone(&chrono::Local)
