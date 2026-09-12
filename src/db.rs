@@ -1,4 +1,4 @@
-//! Read per-call usage out of Devin's `sessions.db` (SQLite).
+//! Read per-call usage out of Devin's `sessions.db` (SQLite via rusqlite).
 //!
 //! Transcripts only serialize the *current* chain of a session; resumed,
 //! compacted or forked chains — and subagent sessions, which never get a
@@ -53,73 +53,40 @@ pub fn load(path: &Path) -> Result<DbData> {
         }
     }
 
-    // message_id/message role live in the first ~100 bytes of chat_message;
-    // fetch only the head + metadata + ts, then dedupe.
-    let mut calls: HashMap<(String, String), (u64, i64)> = HashMap::new();
+    // All JSON extraction and per-message_id dedup happens in SQL.
+    let mut calls = Vec::new();
     {
         let mut st = conn.prepare(
-            "SELECT session_id, substr(chat_message,1,300), metadata, created_at \
-             FROM message_nodes",
+            "SELECT session_id, mid, MAX(ntp), MIN(ts) FROM (
+                 SELECT session_id,
+                        json_extract(chat_message, '$.message_id') AS mid,
+                        COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0) AS ntp,
+                        created_at AS ts
+                 FROM message_nodes
+                 WHERE json_extract(chat_message, '$.role') = 'assistant'
+             )
+             WHERE mid IS NOT NULL
+             GROUP BY session_id, mid",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
+                r.get::<_, f64>(2)?,
                 r.get::<_, i64>(3)?,
             ))
         })?;
         for r in rows {
-            let (sid, head, meta, ts) = r?;
-            if !is_assistant(&head) {
-                continue;
-            }
-            let Some(mid) = json_str(&head, "message_id") else {
-                continue;
-            };
-            let ntp = meta.as_deref().and_then(num_tokens_preceding).unwrap_or(0);
-            let e = calls.entry((sid, mid.to_string())).or_insert((0, i64::MAX));
-            e.0 = e.0.max(ntp);
-            e.1 = e.1.min(ts);
+            let (session, prompt, ts) = r?;
+            calls.push(DbCall {
+                session,
+                ts,
+                prompt: prompt as u64,
+            });
         }
     }
 
     Ok(DbData {
         session_models,
-        calls: calls
-            .into_iter()
-            .map(|((session, _), (prompt, ts))| DbCall {
-                session,
-                ts,
-                prompt,
-            })
-            .collect(),
+        calls,
     })
-}
-
-/// head starts `{"message_id":"…","role":"assistant",…}` — check the role field.
-fn is_assistant(head: &str) -> bool {
-    let Some(i) = head.find("\"role\":") else {
-        return false;
-    };
-    head[i + 7..].trim_start().starts_with("\"assistant\"")
-}
-
-/// `"key":"value"` extraction without a full JSON parse.
-fn json_str<'a>(s: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\":\"");
-    let start = s.find(&pat)? + pat.len();
-    let end = s[start..].find('"')? + start;
-    Some(&s[start..end])
-}
-
-/// `…,"num_tokens_preceding":12345,…` → 12345
-fn num_tokens_preceding(meta: &str) -> Option<u64> {
-    const PAT: &str = "\"num_tokens_preceding\":";
-    let start = meta.find(PAT)? + PAT.len();
-    let rest = &meta[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
 }
