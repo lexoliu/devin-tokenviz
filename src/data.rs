@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -72,10 +72,31 @@ pub struct Session {
     pub has_unpriced: bool,
 }
 
+/// Usage in one time bucket (hour / day / week).
+#[derive(Debug, Default)]
+pub struct Bucket {
+    pub label: String,
+    pub usage: Usage,
+    pub list_cost: f64,
+    pub actual_cost: f64,
+    pub has_unpriced: bool,
+}
+
+/// How the per-bucket timeline is sliced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketKind {
+    Hour,
+    Day,
+    Week,
+    /// Day if the span is short, Week for long spans.
+    Auto,
+}
+
 #[derive(Debug)]
 pub struct Report {
     pub models: Vec<ModelStat>,
     pub sessions: Vec<Session>,
+    pub buckets: Vec<Bucket>,
     pub total: Usage,
     pub total_steps: usize,
     pub list_cost: f64,
@@ -116,10 +137,14 @@ pub fn default_data_dir() -> PathBuf {
         .join(".local/share/devin/cli/transcripts")
 }
 
-/// Scan `dir` for transcript JSON files and aggregate usage.
-pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
-    let cutoff = days.map(|d| Utc::now() - chrono::Duration::days(d as i64));
-
+/// Scan `dir` for transcript JSON files and aggregate usage, keeping only
+/// steps at or after `since` (None = all time).
+pub fn load(
+    dir: &Path,
+    book: &PriceBook,
+    since: Option<DateTime<Utc>>,
+    bucket: BucketKind,
+) -> Result<Report> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("cannot read transcript dir {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -130,6 +155,7 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
     let mut report = Report {
         models: Vec::new(),
         sessions: Vec::new(),
+        buckets: Vec::new(),
         total: Usage::default(),
         total_steps: 0,
         list_cost: 0.0,
@@ -143,6 +169,9 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
 
     // label -> index into report.models
     let mut model_idx: BTreeMap<String, usize> = BTreeMap::new();
+    // timeline buckets: day-keyed always, hour-keyed only for Hour reports
+    let mut day_buckets: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
+    let mut hour_buckets: BTreeMap<String, Bucket> = BTreeMap::new();
 
     for path in files {
         let text = match fs::read_to_string(&path) {
@@ -189,7 +218,7 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
                 .as_deref()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|t| t.with_timezone(&Utc));
-            if let (Some(c), Some(t)) = (cutoff, ts)
+            if let (Some(c), Some(t)) = (since, ts)
                 && t < c
             {
                 continue;
@@ -201,6 +230,8 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
                 output: m.completion_tokens,
             };
             let resolved = book.resolve(raw_model);
+            let step_cost = resolved.price.as_ref().map(|p| usage.cost(p));
+            let step_paid = matches!(resolved.pricing, Pricing::Paid);
 
             let idx = *model_idx.entry(resolved.label.clone()).or_insert_with(|| {
                 report.models.push(ModelStat {
@@ -233,14 +264,34 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
                 (None, b) => b,
                 (a, None) => a,
             };
-            if let Some(p) = &resolved.price {
-                let cost = usage.cost(p);
-                session.list_cost += cost;
-                if matches!(resolved.pricing, Pricing::Paid) {
-                    session.actual_cost += cost;
+            if let Some(c) = step_cost {
+                session.list_cost += c;
+                if step_paid {
+                    session.actual_cost += c;
                 }
             } else {
                 session.has_unpriced = true;
+            }
+
+            if let Some(t) = ts {
+                let local = t.with_timezone(&Local);
+                let day_key = local.date_naive();
+                let bump = |b: &mut Bucket| {
+                    b.usage.add(&usage);
+                    if let Some(c) = step_cost {
+                        b.list_cost += c;
+                        if step_paid {
+                            b.actual_cost += c;
+                        }
+                    } else {
+                        b.has_unpriced = true;
+                    }
+                };
+                bump(day_buckets.entry(day_key).or_default());
+                if bucket == BucketKind::Hour {
+                    let key = local.format("%Y-%m-%d %H").to_string();
+                    bump(hour_buckets.entry(key).or_default());
+                }
             }
 
             report.total.add(&usage);
@@ -278,6 +329,28 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
         }
     }
 
+    // resolve Auto and build the final ordered bucket list, filling gaps
+    let span_days = match (report.earliest, report.latest) {
+        (Some(a), Some(b)) => (b - a).num_days().max(1),
+        _ => 1,
+    };
+    let kind = match bucket {
+        BucketKind::Auto => {
+            if span_days > 45 {
+                BucketKind::Week
+            } else {
+                BucketKind::Day
+            }
+        }
+        k => k,
+    };
+    report.buckets = match kind {
+        BucketKind::Hour => finalize_hours(hour_buckets, since, report.latest),
+        BucketKind::Day => finalize_days(day_buckets, since, report.earliest, report.latest),
+        BucketKind::Week => finalize_weeks(day_buckets),
+        BucketKind::Auto => unreachable!(),
+    };
+
     report
         .models
         .sort_by_key(|m| std::cmp::Reverse(m.usage.total()));
@@ -285,4 +358,104 @@ pub fn load(dir: &Path, book: &PriceBook, days: Option<u32>) -> Result<Report> {
         .sessions
         .sort_by_key(|s| std::cmp::Reverse(s.last_ts));
     Ok(report)
+}
+
+fn finalize_hours(
+    mut buckets: BTreeMap<String, Bucket>,
+    since: Option<DateTime<Utc>>,
+    latest: Option<DateTime<Utc>>,
+) -> Vec<Bucket> {
+    let end = latest.unwrap_or_else(Utc::now).with_timezone(&Local);
+    let start = since.unwrap_or_else(|| Utc::now() - Duration::hours(23));
+    let mut cur = start
+        .with_timezone(&Local)
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or_else(|| start.with_timezone(&Local));
+    let mut out = Vec::new();
+    while cur <= end {
+        let key = cur.format("%Y-%m-%d %H").to_string();
+        let mut b = buckets.remove(&key).unwrap_or_default();
+        b.label = cur.format("%b %d %H:00").to_string();
+        out.push(b);
+        cur += Duration::hours(1);
+    }
+    // any stragglers beyond `end` (clock skew)
+    for (_, mut b) in buckets {
+        if b.usage.total() > 0 {
+            b.label = "?".into();
+            out.push(b);
+        }
+    }
+    // drop leading empty buckets so the timeline starts at first activity
+    let first = out.iter().position(|b| b.usage.total() > 0).unwrap_or(0);
+    out.drain(..first);
+    out
+}
+
+fn finalize_days(
+    mut buckets: BTreeMap<NaiveDate, Bucket>,
+    since: Option<DateTime<Utc>>,
+    earliest: Option<DateTime<Utc>>,
+    latest: Option<DateTime<Utc>>,
+) -> Vec<Bucket> {
+    let end = latest
+        .unwrap_or_else(Utc::now)
+        .with_timezone(&Local)
+        .date_naive();
+    let start = since
+        .or(earliest)
+        .map(|t| t.with_timezone(&Local).date_naive())
+        .unwrap_or(end);
+    let mut out = Vec::new();
+    let mut cur = start;
+    while cur <= end {
+        let mut b = buckets.remove(&cur).unwrap_or_default();
+        b.label = cur.format("%b %d").to_string();
+        out.push(b);
+        cur += Duration::days(1);
+    }
+    for (_, mut b) in buckets {
+        if b.usage.total() > 0 {
+            b.label = "?".into();
+            out.push(b);
+        }
+    }
+    let first = out.iter().position(|b| b.usage.total() > 0).unwrap_or(0);
+    out.drain(..first);
+    out
+}
+
+fn finalize_weeks(days: BTreeMap<NaiveDate, Bucket>) -> Vec<Bucket> {
+    let mut weeks: BTreeMap<(i32, u32), Bucket> = BTreeMap::new();
+    for (d, b) in days {
+        if b.usage.total() == 0 {
+            continue;
+        }
+        let w = d.iso_week();
+        weeks
+            .entry((w.year(), w.week()))
+            .or_default()
+            .usage
+            .add(&b.usage);
+        let wb = weeks.get_mut(&(w.year(), w.week())).unwrap();
+        wb.list_cost += b.list_cost;
+        wb.actual_cost += b.actual_cost;
+        wb.has_unpriced |= b.has_unpriced;
+    }
+    weeks
+        .into_iter()
+        .map(|((y, w), mut b)| {
+            let mon = NaiveDate::from_isoywd_opt(y, w, chrono::Weekday::Mon);
+            let sun = NaiveDate::from_isoywd_opt(y, w, chrono::Weekday::Sun);
+            b.label = match (mon, sun) {
+                (Some(m), Some(s)) => {
+                    format!("{}–{}", m.format("%b %d"), s.format("%b %d"))
+                }
+                _ => format!("{y}-W{w:02}"),
+            };
+            b
+        })
+        .collect()
 }
