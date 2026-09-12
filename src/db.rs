@@ -83,7 +83,7 @@ fn prefetch(path: &Path, offset: u64) -> Arc<AtomicBool> {
     stop
 }
 
-pub fn load(path: &Path) -> Result<DbData> {
+fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open {}", path.display()))?;
     // Memory-map the multi-GB file: turns the scan into page-cache hits
@@ -91,6 +91,54 @@ pub fn load(path: &Path) -> Result<DbData> {
     // tail is read through the page cache, so give it room.
     conn.pragma_update(None, "mmap_size", 8_000_000_000i64)?;
     conn.pragma_update(None, "cache_size", -2_000_000i64)?;
+    Ok(conn)
+}
+
+/// chat_message is compact JSON with a fixed key order:
+///   {"message_id":"<36-byte uuid>","role":"assistant",...
+/// Both invariants are anchored with cheap byte-prefix checks instead of
+/// json_extract on the multi-KB blob (which would pull every overflow
+/// page). Verified over the whole table: the filters match exactly the
+/// rows where json_extract($.role) = 'assistant', and substr(16,36)
+/// equals $.message_id for every one of them. If Devin ever changes the
+/// serialization, rows are missed — never merged.
+fn scan_range(path: &Path, lo: i64, hi: i64) -> Result<Vec<RawRow>> {
+    let conn = open(path)?;
+    let mut st = conn.prepare(
+        "SELECT row_id, session_id,
+                substr(chat_message, 16, 36),
+                COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0),
+                created_at
+         FROM message_nodes
+         WHERE row_id >= ?1 AND row_id < ?2
+           AND substr(chat_message, 1, 15) = '{\"message_id\":\"'
+           AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'",
+    )?;
+    let rs = st.query_map([lo, hi], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, f64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rs {
+        let (row_id, session, mid, ntp, ts) = r?;
+        out.push(RawRow {
+            row_id,
+            session,
+            mid,
+            ntp: ntp as u64,
+            ts,
+        });
+    }
+    Ok(out)
+}
+
+pub fn load(path: &Path) -> Result<DbData> {
+    let conn = open(path)?;
 
     let mut session_models = HashMap::new();
     {
@@ -120,42 +168,44 @@ pub fn load(path: &Path) -> Result<DbData> {
         let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let stop = prefetch(path, file_len * start as u64 / (cur_max as u64 + 1));
 
-        // chat_message is compact JSON with a fixed key order:
-        //   {"message_id":"<36-byte uuid>","role":"assistant",...
-        // Both invariants are anchored with cheap byte-prefix checks instead
-        // of json_extract on the multi-KB blob (which would pull every
-        // overflow page). Verified over the whole table: the filters match
-        // exactly the rows where json_extract($.role) = 'assistant', and
-        // substr(16,36) equals $.message_id for every one of them. If Devin
-        // ever changes the serialization, rows are missed — never merged.
-        let mut st = conn.prepare(
-            "SELECT row_id, session_id,
-                    substr(chat_message, 16, 36),
-                    COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0),
-                    created_at
-             FROM message_nodes
-             WHERE row_id >= ?1
-               AND substr(chat_message, 1, 15) = '{\"message_id\":\"'
-               AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'",
-        )?;
-        let rs = st.query_map([start], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })?;
-        for r in rs {
-            let (row_id, session, mid, ntp, ts) = r?;
-            rows.push(RawRow {
-                row_id,
-                session,
-                mid,
-                ntp: ntp as u64,
-                ts,
+        // Split [start, cur_max] over several read-only connections — WAL
+        // mode allows concurrent readers, and each worker's B-tree range
+        // scan reads disjoint page runs. The per-row work (record decode +
+        // json_extract on metadata) is the real CPU cost and splits across
+        // cores; the byte-prefix filters are already memcmp-cheap.
+        let workers: usize = std::env::var("TVIZ_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(8))
+                    .unwrap_or(4)
             });
+        let span = cur_max - start + 1;
+        let workers = if span < 20_000 { 1 } else { workers.max(1) };
+        let chunk = (span + workers as i64 - 1) / workers as i64;
+
+        let t0 = std::time::Instant::now();
+        let mut parts: Vec<Result<Vec<RawRow>>> = Vec::new();
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for w in 0..workers {
+                let lo = start + w as i64 * chunk;
+                let hi = (lo + chunk).min(cur_max + 1);
+                if lo >= hi {
+                    break;
+                }
+                handles.push(s.spawn(move || scan_range(path, lo, hi)));
+            }
+            for h in handles {
+                parts.push(h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("panic"))));
+            }
+        });
+        if std::env::var_os("TVIZ_DEBUG").is_some() {
+            eprintln!("[t] scan {workers}w -> {:?}", t0.elapsed());
+        }
+        for p in parts {
+            rows.extend(p?);
         }
         stop.store(true, Ordering::Relaxed);
         cache::save(path, cur_max, &rows);
