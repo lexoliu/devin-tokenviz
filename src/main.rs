@@ -1,3 +1,4 @@
+mod cache;
 mod data;
 mod db;
 mod fmt;

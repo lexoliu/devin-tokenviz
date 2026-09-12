@@ -9,11 +9,19 @@
 //!
 //! The same logical message is stored twice per node (with/without metadata),
 //! so calls are deduped by `message_id`, keeping the max `num_tokens_preceding`.
+//!
+//! Rows are insert-only, so matched rows are cached on disk and each run
+//! scans just the `row_id` tail beyond the cached high-water mark.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::cache;
 
 /// One inference call recovered from the sessions.db message tree.
 #[derive(Debug)]
@@ -23,6 +31,17 @@ pub struct DbCall {
     pub ts: i64,
     /// Exact prompt tokens for this call; 0 when the node recorded none.
     pub prompt: u64,
+}
+
+/// A matched assistant message row — the unit persisted between runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawRow {
+    pub row_id: i64,
+    pub session: String,
+    pub mid: String,
+    /// num_tokens_preceding, 0 when the node recorded none.
+    pub ntp: u64,
+    pub ts: i64,
 }
 
 #[derive(Debug, Default)]
@@ -39,37 +58,39 @@ pub fn default_db_path() -> PathBuf {
         .join(".local/share/devin/cli/sessions.db")
 }
 
-/// Sequentially read the db + wal into the OS page cache on a background
-/// thread. SQLite then fetches its scattered 4KB pages from RAM instead of
-/// doing ~300k random reads against a live, WAL-mode multi-GB file.
-/// Sequential readahead of the whole file is far faster than the pages we
-/// actually need fetched at random offsets.
-fn prefetch(path: &Path) {
+/// Sequentially read the db + wal into the OS page cache on background
+/// threads, starting at `offset` for the main file. SQLite then fetches its
+/// scattered 4KB pages from RAM instead of doing ~300k random reads against
+/// a live, WAL-mode multi-GB file. Returns a flag that stops the threads.
+fn prefetch(path: &Path, offset: u64) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
     for suffix in ["", "-wal"] {
         let p = PathBuf::from(format!("{}{suffix}", path.display()));
+        let stop = stop.clone();
         std::thread::spawn(move || {
-            use std::io::Read;
+            use std::io::{Read, Seek, SeekFrom};
             let mut f = match std::fs::File::open(&p) {
                 Ok(f) => f,
                 Err(_) => return,
             };
+            if suffix.is_empty() && f.seek(SeekFrom::Start(offset)).is_err() {
+                return;
+            }
             let mut buf = vec![0u8; 8 << 20];
-            while matches!(f.read(&mut buf), Ok(n) if n > 0) {}
+            while !stop.load(Ordering::Relaxed) && matches!(f.read(&mut buf), Ok(n) if n > 0) {}
         });
     }
+    stop
 }
 
 pub fn load(path: &Path) -> Result<DbData> {
-    prefetch(path);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open {}", path.display()))?;
     // Memory-map the multi-GB file: turns the scan into page-cache hits
-    // instead of read() syscalls.
+    // instead of read() syscalls. mmap is capped at 2GB < file size — the
+    // tail is read through the page cache, so give it room.
     conn.pragma_update(None, "mmap_size", 8_000_000_000i64)?;
-    // mmap is capped at 2GB < file size — the tail is read through the page
-    // cache, so give it room. Temp b-trees (GROUP BY) stay in RAM.
     conn.pragma_update(None, "cache_size", -2_000_000i64)?;
-    conn.pragma_update(None, "temp_store", 2i64)?;
 
     let mut session_models = HashMap::new();
     {
@@ -81,44 +102,81 @@ pub fn load(path: &Path) -> Result<DbData> {
         }
     }
 
-    // All extraction and per-message_id dedup happens in SQL.
-    //
-    // chat_message is compact JSON with a fixed key order:
-    //   {"message_id":"<36-byte uuid>","role":"assistant",...
-    // Both invariants are anchored with cheap byte-prefix checks instead of
-    // json_extract on the multi-KB blob (which would pull every overflow
-    // page). Verified over the whole table: the filters match exactly the
-    // rows where json_extract($.role) = 'assistant', and substr(16,36)
-    // equals $.message_id for every one of them (0 mismatches). If Devin
-    // ever changes the serialization, rows are missed — never merged.
-    let mut calls = Vec::new();
-    {
+    let cur_max: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(row_id), 0) FROM message_nodes",
+        [],
+        |r| r.get(0),
+    )?;
+
+    // Resume from the incremental cache when possible.
+    let (mut rows, start) = match cache::load(path, cur_max) {
+        Some((max_rowid, cached)) => (cached, max_rowid + 1),
+        None => (Vec::new(), 0),
+    };
+
+    if start <= cur_max {
+        // Estimate the byte offset of row `start` (row_ids grow roughly
+        // linearly with file bytes) and warm the page cache from there.
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let stop = prefetch(path, file_len * start as u64 / (cur_max as u64 + 1));
+
+        // chat_message is compact JSON with a fixed key order:
+        //   {"message_id":"<36-byte uuid>","role":"assistant",...
+        // Both invariants are anchored with cheap byte-prefix checks instead
+        // of json_extract on the multi-KB blob (which would pull every
+        // overflow page). Verified over the whole table: the filters match
+        // exactly the rows where json_extract($.role) = 'assistant', and
+        // substr(16,36) equals $.message_id for every one of them. If Devin
+        // ever changes the serialization, rows are missed — never merged.
         let mut st = conn.prepare(
-            "SELECT session_id,
-                    substr(chat_message, 16, 36) AS mid,
-                    MAX(COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0)),
-                    MIN(created_at)
+            "SELECT row_id, session_id,
+                    substr(chat_message, 16, 36),
+                    COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0),
+                    created_at
              FROM message_nodes
-             WHERE substr(chat_message, 1, 15) = '{\"message_id\":\"'
-               AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'
-             GROUP BY session_id, mid",
+             WHERE row_id >= ?1
+               AND substr(chat_message, 1, 15) = '{\"message_id\":\"'
+               AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'",
         )?;
-        let rows = st.query_map([], |r| {
+        let rs = st.query_map([start], |r| {
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })?;
-        for r in rows {
-            let (session, prompt, ts) = r?;
-            calls.push(DbCall {
+        for r in rs {
+            let (row_id, session, mid, ntp, ts) = r?;
+            rows.push(RawRow {
+                row_id,
                 session,
+                mid,
+                ntp: ntp as u64,
                 ts,
-                prompt: prompt as u64,
             });
         }
+        stop.store(true, Ordering::Relaxed);
+        cache::save(path, cur_max, &rows);
     }
+
+    // Dedup by (session, message_id): keep the max token count (metadata
+    // and metadata-less copies of the same node pair) and earliest time.
+    let mut best: HashMap<(String, String), (u64, i64)> = HashMap::new();
+    for r in rows {
+        let e = best.entry((r.session, r.mid)).or_insert((0, i64::MAX));
+        e.0 = e.0.max(r.ntp);
+        e.1 = e.1.min(r.ts);
+    }
+    let calls = best
+        .into_iter()
+        .map(|((session, _), (prompt, ts))| DbCall {
+            session,
+            ts,
+            prompt,
+        })
+        .collect();
 
     Ok(DbData {
         session_models,

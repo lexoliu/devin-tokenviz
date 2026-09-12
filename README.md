@@ -81,6 +81,11 @@ Two local sources are merged:
    On a real install this roughly **6x'd** the visible token total — most of
    the difference was subagent runs and resumed sessions.
 
+   `message_nodes` is append-only, so matched rows are cached in
+   `~/.cache/devin-tokenviz/` and each run scans only the new `row_id` tail —
+   repeat runs take ~0.1s after the first full scan (~3s on a multi-GB db).
+   Delete the directory to force a rescan.
+
    Disable with `--transcripts-only`.
 
 ## Pricing
