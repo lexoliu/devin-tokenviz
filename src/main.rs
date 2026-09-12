@@ -1,4 +1,5 @@
 mod data;
+mod db;
 mod fmt;
 mod pricing;
 mod render;
@@ -25,6 +26,14 @@ struct Args {
     /// TOML file with extra [[rule]] pricing entries (takes precedence over built-ins).
     #[arg(long, value_name = "FILE", global = true)]
     pricing: Option<PathBuf>,
+
+    /// Devin sessions.db path (used to recover calls missing from transcripts).
+    #[arg(long, value_name = "FILE", global = true)]
+    db: Option<PathBuf>,
+
+    /// Only count transcript files; do not read sessions.db.
+    #[arg(long, global = true)]
+    transcripts_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -69,7 +78,16 @@ fn main() -> anyhow::Result<()> {
     let book = pricing::PriceBook::new(rules);
 
     let dir = args.data_dir.unwrap_or_else(data::default_data_dir);
-    let report = data::load(&dir, &book, since, bucket)?;
+    let db_path = if args.transcripts_only {
+        None
+    } else {
+        Some(args.db.clone().unwrap_or_else(|| {
+            dir.parent()
+                .map(|p| p.join("sessions.db"))
+                .unwrap_or_else(db::default_db_path)
+        }))
+    };
+    let report = data::load(&dir, db_path.as_deref(), &book, since, bucket)?;
     print!("{}", render::render(&report, desc, Pal::detect()));
     Ok(())
 }

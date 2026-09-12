@@ -137,6 +137,10 @@ fn cost_cells(
                 pad_st(p, &m, wa, true, |p, s| p.money(s)),
             )
         }
+        (Pricing::Free { .. }, None) => (
+            pad_st(p, "?", wl, true, |p, s| p.dim(s)),
+            pad_st(p, "$0.00", wa, true, |p, s| p.free(s)),
+        ),
         _ => (
             pad_st(p, "?", wl, true, |p, s| p.dim(s)),
             pad_st(p, "?", wa, true, |p, s| p.dim(s)),
@@ -167,11 +171,30 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
         p.bold(format!("devin-tokenviz · {range_desc} · {range}"))
     ));
     o.push_str(&format!(
-        "{} sessions · {} steps · {} tokens\n",
+        "{} sessions · {} calls · {} tokens\n",
         r.sessions.len(),
         r.total_steps,
         p.bold(fmt::tokens(r.total.total()))
     ));
+    if r.db_used {
+        o.push_str(&format!(
+            "{}\n",
+            p.dim(format!(
+                "coverage: {} transcripts · +{} calls ({} tok) recovered from sessions.db — resumed chains & subagent runs",
+                r.files_read,
+                r.db_recovered_calls,
+                fmt::tokens(r.db_recovered_tokens),
+            ))
+        ));
+    } else {
+        o.push_str(&format!(
+            "{}\n",
+            p.dim(format!(
+                "coverage: {} transcripts — resumed chains & subagent runs not counted",
+                r.files_read
+            ))
+        ));
+    }
     o.push_str(&format!(
         "{} {} · {} {} · {} {}\n",
         p.input("input"),
@@ -265,7 +288,8 @@ pub fn render(r: &Report, range_desc: &str, p: Pal) -> String {
     let max_t = r.models.iter().map(|m| m.usage.total()).max().unwrap_or(1);
     for m in &r.models {
         let priced_as = match &m.pricing {
-            Pricing::Free { billed_as } => format!("{billed_as} *"),
+            Pricing::Free { billed_as } if m.price.is_some() => format!("{billed_as} *"),
+            Pricing::Free { .. } => "n/a *".into(),
             Pricing::Paid => "list".into(),
             Pricing::Unpriced => "?".into(),
         };

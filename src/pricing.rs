@@ -267,8 +267,16 @@ fn default_rules() -> Vec<Rule> {
             0.15,
             7.50,
         ),
-        // --- Z.ai ---
-        r("glm-5", "GLM-5", false, None, 1.40, 0.26, 4.40),
+        // open models offered free inside Devin CLI; no public equivalent price
+        Rule {
+            pattern: normalize("penguin"),
+            label: "Penguin".into(),
+            free: true,
+            billed_as: None,
+            price: None,
+        },
+        // --- Z.ai (free in Devin CLI) ---
+        r("glm-5", "GLM-5", true, Some("glm-5"), 1.40, 0.26, 4.40),
         // --- Moonshot (direct usage) ---
         r("kimi-k3", "Kimi K3", false, None, 3.00, 0.30, 15.00),
         r("kimi-k2-7", "Kimi K2.7 Code", false, None, 0.95, 0.19, 4.00),
