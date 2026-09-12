@@ -3,6 +3,7 @@ mod db;
 mod fmt;
 mod pricing;
 mod render;
+mod spin;
 
 use std::path::PathBuf;
 
@@ -87,7 +88,11 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(db::default_db_path)
         }))
     };
+    let spinner = db_path
+        .as_ref()
+        .map(|p| spin::start(&format!("reading {}", p.display())));
     let report = data::load(&dir, db_path.as_deref(), &book, since, bucket)?;
+    drop(spinner);
     print!("{}", render::render(&report, desc, Pal::detect()));
     Ok(())
 }
