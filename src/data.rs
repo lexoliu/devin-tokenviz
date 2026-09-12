@@ -2,9 +2,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::db;
 use crate::pricing::{Price, PriceBook, Pricing};
 
 /// Token usage for a single step or aggregate. `input` is the *uncached*
@@ -106,6 +108,13 @@ pub struct Report {
     pub files_failed: usize,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
+    /// sessions.db was read successfully.
+    pub db_used: bool,
+    /// Calls recovered from sessions.db that are not in any transcript
+    /// (resumed/compacted/forked chains and subagent sessions).
+    pub db_recovered_calls: usize,
+    /// Input tokens carried by those recovered calls.
+    pub db_recovered_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -131,16 +140,27 @@ struct Metrics {
     cached_tokens: u64,
 }
 
+/// One model call, from either source.
+struct Ev {
+    session: String,
+    model: String,
+    ts: Option<DateTime<Utc>>,
+    usage: Usage,
+    /// Recovered from sessions.db (not present in any transcript).
+    recovered: bool,
+}
+
 pub fn default_data_dir() -> PathBuf {
     std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".local/share/devin/cli/transcripts")
 }
 
-/// Scan `dir` for transcript JSON files and aggregate usage, keeping only
-/// steps at or after `since` (None = all time).
+/// Scan `dir` for transcript JSONs, then recover extra calls from `db_path`
+/// (sessions.db) when given, and aggregate usage at or after `since`.
 pub fn load(
     dir: &Path,
+    db_path: Option<&Path>,
     book: &PriceBook,
     since: Option<DateTime<Utc>>,
     bucket: BucketKind,
@@ -152,59 +172,40 @@ pub fn load(
         .collect();
     files.sort();
 
-    let mut report = Report {
-        models: Vec::new(),
-        sessions: Vec::new(),
-        buckets: Vec::new(),
-        total: Usage::default(),
-        total_steps: 0,
-        list_cost: 0.0,
-        actual_cost: 0.0,
-        has_unpriced: false,
-        files_read: 0,
-        files_failed: 0,
-        earliest: None,
-        latest: None,
-    };
-
-    // label -> index into report.models
-    let mut model_idx: BTreeMap<String, usize> = BTreeMap::new();
-    // timeline buckets: day-keyed always, hour-keyed only for Hour reports
-    let mut day_buckets: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
-    let mut hour_buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+    let mut events: Vec<Ev> = Vec::new();
+    // session -> multiset of prompt sizes, for exact dedup against db calls
+    let mut prompt_ms: BTreeMap<String, BTreeMap<u64, u64>> = BTreeMap::new();
+    // session -> (cached sum, prompt sum, output sum) -> share estimates
+    let mut ratios: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    // session -> (dominant raw model, its prompt sum) as fallback model name
+    let mut top_model: HashMap<String, (String, u64)> = HashMap::new();
+    let mut g_cached: u64 = 0;
+    let mut g_prompt: u64 = 0;
+    let mut g_output: u64 = 0;
+    let mut files_read = 0usize;
+    let mut files_failed = 0usize;
 
     for path in files {
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => {
-                report.files_failed += 1;
+                files_failed += 1;
                 continue;
             }
         };
         let t: Transcript = match serde_json::from_str(&text) {
             Ok(t) => t,
             Err(_) => {
-                report.files_failed += 1;
+                files_failed += 1;
                 continue;
             }
         };
-        report.files_read += 1;
-
+        files_read += 1;
         let name = path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let mut session = Session {
-            name,
-            last_ts: None,
-            usage: Usage::default(),
-            steps: 0,
-            models: BTreeMap::new(),
-            list_cost: 0.0,
-            actual_cost: 0.0,
-            has_unpriced: false,
-        };
 
         for step in &t.steps {
             let (Some(m), Some(raw_model)) = (&step.metrics, &step.model_name) else {
@@ -218,102 +219,227 @@ pub fn load(
                 .as_deref()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|t| t.with_timezone(&Utc));
-            if let (Some(c), Some(t)) = (since, ts)
-                && t < c
-            {
-                continue;
-            }
-
+            let cached = m.cached_tokens.min(m.prompt_tokens);
             let usage = Usage {
-                input: m.prompt_tokens.saturating_sub(m.cached_tokens),
-                cached: m.cached_tokens,
+                input: m.prompt_tokens - cached,
+                cached,
                 output: m.completion_tokens,
             };
-            let resolved = book.resolve(raw_model);
-            let step_cost = resolved.price.as_ref().map(|p| usage.cost(p));
-            let step_paid = matches!(resolved.pricing, Pricing::Paid);
-
-            let idx = *model_idx.entry(resolved.label.clone()).or_insert_with(|| {
-                report.models.push(ModelStat {
-                    label: resolved.label.clone(),
-                    raw_names: Vec::new(),
-                    usage: Usage::default(),
-                    sessions: 0,
-                    steps: 0,
-                    pricing: resolved.pricing.clone(),
-                    price: resolved.price,
-                });
-                report.models.len() - 1
-            });
-            let stat = &mut report.models[idx];
-            if !stat.raw_names.iter().any(|n| n == raw_model) {
-                stat.raw_names.push(raw_model.clone());
-            }
-            stat.usage.add(&usage);
-            stat.steps += 1;
-
-            session
-                .models
-                .entry(resolved.label.clone())
+            *prompt_ms
+                .entry(name.clone())
                 .or_default()
-                .add(&usage);
-            session.usage.add(&usage);
-            session.steps += 1;
-            session.last_ts = match (session.last_ts, ts) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (None, b) => b,
-                (a, None) => a,
-            };
-            if let Some(c) = step_cost {
-                session.list_cost += c;
-                if step_paid {
-                    session.actual_cost += c;
-                }
+                .entry(m.prompt_tokens)
+                .or_default() += 1;
+            let r = ratios.entry(name.clone()).or_default();
+            r.0 += cached;
+            r.1 += m.prompt_tokens;
+            r.2 += m.completion_tokens;
+            g_cached += cached;
+            g_prompt += m.prompt_tokens;
+            g_output += m.completion_tokens;
+            let tm = top_model.entry(name.clone()).or_default();
+            if m.prompt_tokens > tm.1 {
+                *tm = (raw_model.clone(), m.prompt_tokens);
+            }
+            events.push(Ev {
+                session: name.clone(),
+                model: raw_model.clone(),
+                ts,
+                usage,
+                recovered: false,
+            });
+        }
+    }
+
+    // ── recover calls from sessions.db ──────────────────────────────────
+    let mut db_used = false;
+    if let Some(p) = db_path
+        && let Ok(d) = db::load(p)
+    {
+        db_used = true;
+        let g_ratio = if g_prompt > 0 {
+            (
+                g_cached as f64 / g_prompt as f64,
+                g_output as f64 / g_prompt as f64,
+            )
+        } else {
+            (0.9, 0.006)
+        };
+        for call in d.calls {
+            if call.prompt == 0 {
+                continue;
+            }
+            // exact match against a transcript step's prompt => same call
+            if let Some(ms) = prompt_ms.get_mut(&call.session)
+                && let Some(n) = ms.get_mut(&call.prompt)
+                && *n > 0
+            {
+                *n -= 1;
+                continue;
+            }
+            // split the recovered prompt into cached/uncached at the session's
+            // observed ratio, and estimate output at its observed out:in ratio
+            let (cs, ps, os) = ratios.get(&call.session).copied().unwrap_or((0, 0, 0));
+            let (cr, or_) = if ps > 0 {
+                (cs as f64 / ps as f64, os as f64 / ps as f64)
             } else {
-                session.has_unpriced = true;
-            }
-
-            if let Some(t) = ts {
-                let local = t.with_timezone(&Local);
-                let day_key = local.date_naive();
-                let bump = |b: &mut Bucket| {
-                    b.usage.add(&usage);
-                    if let Some(c) = step_cost {
-                        b.list_cost += c;
-                        if step_paid {
-                            b.actual_cost += c;
-                        }
-                    } else {
-                        b.has_unpriced = true;
-                    }
-                };
-                bump(day_buckets.entry(day_key).or_default());
-                if bucket == BucketKind::Hour {
-                    let key = local.format("%Y-%m-%d %H").to_string();
-                    bump(hour_buckets.entry(key).or_default());
-                }
-            }
-
-            report.total.add(&usage);
-            report.total_steps += 1;
-            report.earliest = match (report.earliest, ts) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (None, b) => b,
-                (a, None) => a,
+                g_ratio
             };
-            report.latest = match (report.latest, ts) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (None, b) => b,
-                (a, None) => a,
-            };
+            let cached = ((call.prompt as f64 * cr).round() as u64).min(call.prompt);
+            let output = (call.prompt as f64 * or_).round() as u64;
+            let model = d
+                .session_models
+                .get(&call.session)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| top_model.get(&call.session).map(|(m, _)| m.clone()))
+                .unwrap_or_else(|| "unknown".to_string());
+            events.push(Ev {
+                session: call.session,
+                model,
+                ts: DateTime::from_timestamp(call.ts, 0),
+                usage: Usage {
+                    input: call.prompt - cached,
+                    cached,
+                    output,
+                },
+                recovered: true,
+            });
+        }
+    }
+
+    // ── aggregate ───────────────────────────────────────────────────────
+    let mut report = Report {
+        models: Vec::new(),
+        sessions: Vec::new(),
+        buckets: Vec::new(),
+        total: Usage::default(),
+        total_steps: 0,
+        list_cost: 0.0,
+        actual_cost: 0.0,
+        has_unpriced: false,
+        files_read,
+        files_failed,
+        earliest: None,
+        latest: None,
+        db_used,
+        db_recovered_calls: 0,
+        db_recovered_tokens: 0,
+    };
+    let mut model_idx: BTreeMap<String, usize> = BTreeMap::new();
+    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    let mut day_buckets: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
+    let mut hour_buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+
+    for ev in events {
+        if let (Some(c), Some(t)) = (since, ev.ts)
+            && t < c
+        {
+            continue;
+        }
+        if ev.recovered {
+            report.db_recovered_calls += 1;
+            report.db_recovered_tokens += ev.usage.input + ev.usage.cached;
+        }
+        let usage = ev.usage;
+        let resolved = book.resolve(&ev.model);
+        let step_cost = resolved.price.as_ref().map(|p| usage.cost(p));
+        let step_paid = matches!(resolved.pricing, Pricing::Paid);
+
+        let idx = *model_idx.entry(resolved.label.clone()).or_insert_with(|| {
+            report.models.push(ModelStat {
+                label: resolved.label.clone(),
+                raw_names: Vec::new(),
+                usage: Usage::default(),
+                sessions: 0,
+                steps: 0,
+                pricing: resolved.pricing.clone(),
+                price: resolved.price,
+            });
+            report.models.len() - 1
+        });
+        let stat = &mut report.models[idx];
+        if !stat.raw_names.iter().any(|n| n == &ev.model) {
+            stat.raw_names.push(ev.model.clone());
+        }
+        stat.usage.add(&usage);
+        stat.steps += 1;
+
+        let session = sessions
+            .entry(ev.session.clone())
+            .or_insert_with(|| Session {
+                name: ev.session.clone(),
+                last_ts: None,
+                usage: Usage::default(),
+                steps: 0,
+                models: BTreeMap::new(),
+                list_cost: 0.0,
+                actual_cost: 0.0,
+                has_unpriced: false,
+            });
+        session
+            .models
+            .entry(resolved.label.clone())
+            .or_default()
+            .add(&usage);
+        session.usage.add(&usage);
+        session.steps += 1;
+        session.last_ts = match (session.last_ts, ev.ts) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, b) => b,
+            (a, None) => a,
+        };
+        if let Some(c) = step_cost {
+            session.list_cost += c;
+            if step_paid {
+                session.actual_cost += c;
+            }
+        } else {
+            session.has_unpriced = true;
         }
 
-        if session.steps > 0 {
-            for label in session.models.keys() {
-                if let Some(&i) = model_idx.get(label) {
-                    report.models[i].sessions += 1;
+        if let Some(t) = ev.ts {
+            let local = t.with_timezone(&Local);
+            let day_key = local.date_naive();
+            let bump = |b: &mut Bucket| {
+                b.usage.add(&usage);
+                if let Some(c) = step_cost {
+                    b.list_cost += c;
+                    if step_paid {
+                        b.actual_cost += c;
+                    }
+                } else {
+                    b.has_unpriced = true;
                 }
+            };
+            bump(day_buckets.entry(day_key).or_default());
+            if bucket == BucketKind::Hour {
+                let key = local.format("%Y-%m-%d %H").to_string();
+                bump(hour_buckets.entry(key).or_default());
             }
+        }
+
+        report.total.add(&usage);
+        report.total_steps += 1;
+        report.earliest = match (report.earliest, ev.ts) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (None, b) => b,
+            (a, None) => a,
+        };
+        report.latest = match (report.latest, ev.ts) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, b) => b,
+            (a, None) => a,
+        };
+    }
+
+    for session in sessions.into_values() {
+        for label in session.models.keys() {
+            if let Some(&i) = model_idx.get(label) {
+                report.models[i].sessions += 1;
+            }
+        }
+        if session.steps > 0 {
             report.sessions.push(session);
         }
     }
