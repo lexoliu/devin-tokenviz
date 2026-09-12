@@ -42,6 +42,13 @@ pub fn default_db_path() -> PathBuf {
 pub fn load(path: &Path) -> Result<DbData> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    // Memory-map the multi-GB file: turns the scan into page-cache hits
+    // instead of read() syscalls.
+    conn.pragma_update(None, "mmap_size", 8_000_000_000i64)?;
+    // mmap is capped at 2GB < file size — the tail is read through the page
+    // cache, so give it room. Temp b-trees (GROUP BY) stay in RAM.
+    conn.pragma_update(None, "cache_size", -2_000_000i64)?;
+    conn.pragma_update(None, "temp_store", 2i64)?;
 
     let mut session_models = HashMap::new();
     {
@@ -53,19 +60,26 @@ pub fn load(path: &Path) -> Result<DbData> {
         }
     }
 
-    // All JSON extraction and per-message_id dedup happens in SQL.
+    // All extraction and per-message_id dedup happens in SQL.
+    //
+    // chat_message is compact JSON with a fixed key order:
+    //   {"message_id":"<36-byte uuid>","role":"assistant",...
+    // Both invariants are anchored with cheap byte-prefix checks instead of
+    // json_extract on the multi-KB blob (which would pull every overflow
+    // page). Verified over the whole table: the filters match exactly the
+    // rows where json_extract($.role) = 'assistant', and substr(16,36)
+    // equals $.message_id for every one of them (0 mismatches). If Devin
+    // ever changes the serialization, rows are missed — never merged.
     let mut calls = Vec::new();
     {
         let mut st = conn.prepare(
-            "SELECT session_id, mid, MAX(ntp), MIN(ts) FROM (
-                 SELECT session_id,
-                        json_extract(chat_message, '$.message_id') AS mid,
-                        COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0) AS ntp,
-                        created_at AS ts
-                 FROM message_nodes
-                 WHERE json_extract(chat_message, '$.role') = 'assistant'
-             )
-             WHERE mid IS NOT NULL
+            "SELECT session_id,
+                    substr(chat_message, 16, 36) AS mid,
+                    MAX(COALESCE(json_extract(metadata, '$.num_tokens_preceding'), 0)),
+                    MIN(created_at)
+             FROM message_nodes
+             WHERE substr(chat_message, 1, 15) = '{\"message_id\":\"'
+               AND substr(chat_message, 1, 120) LIKE '%\"role\":\"assistant\"%'
              GROUP BY session_id, mid",
         )?;
         let rows = st.query_map([], |r| {
