@@ -39,7 +39,28 @@ pub fn default_db_path() -> PathBuf {
         .join(".local/share/devin/cli/sessions.db")
 }
 
+/// Sequentially read the db + wal into the OS page cache on a background
+/// thread. SQLite then fetches its scattered 4KB pages from RAM instead of
+/// doing ~300k random reads against a live, WAL-mode multi-GB file.
+/// Sequential readahead of the whole file is far faster than the pages we
+/// actually need fetched at random offsets.
+fn prefetch(path: &Path) {
+    for suffix in ["", "-wal"] {
+        let p = PathBuf::from(format!("{}{suffix}", path.display()));
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut f = match std::fs::File::open(&p) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let mut buf = vec![0u8; 8 << 20];
+            while matches!(f.read(&mut buf), Ok(n) if n > 0) {}
+        });
+    }
+}
+
 pub fn load(path: &Path) -> Result<DbData> {
+    prefetch(path);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open {}", path.display()))?;
     // Memory-map the multi-GB file: turns the scan into page-cache hits
