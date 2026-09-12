@@ -8,7 +8,7 @@ Pure Rust, one-shot output (no fullscreen TUI): prints the report and exits.
 Colors/ANSI only on a TTY; respects `NO_COLOR`.
 
 ```
-cargo install --git https://github.com/lexoliu/devin-tokenviz
+cargo install --git https://github.com/lexoliu/llmstat
 ```
 
 ## Usage
