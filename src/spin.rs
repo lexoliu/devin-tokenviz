@@ -20,6 +20,8 @@ pub fn start(msg: &str) -> Spinner {
     let msg = msg.to_string();
     let t = std::thread::spawn(move || {
         const F: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        // Hold off briefly — a cache-hit load finishes before we ever draw.
+        std::thread::sleep(Duration::from_millis(150));
         let mut i = 0usize;
         while !flag.load(Ordering::Relaxed) {
             eprint!("\r\x1b[36m{}\x1b[0m {}", F[i % F.len()], msg);
