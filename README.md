@@ -4,11 +4,34 @@ Token usage distribution and cost across local LLM CLIs — one report over
 **Devin CLI**, **Claude Code**, and **Codex CLI**, priced with the LiteLLM
 pricebook.
 
-Pure Rust, one-shot output (no fullscreen TUI): prints the report and exits.
+Pure Rust. Reports print and exit; `monitor` is a live TUI.
 Colors/ANSI only on a TTY; respects `NO_COLOR`.
 
+## Install
+
+Prebuilt binaries ship with every GitHub Release — no Rust toolchain needed.
+
+macOS / Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lexoliu/llmstat/releases/latest/download/llmstat-installer.sh | sh
 ```
-cargo install --git https://github.com/lexoliu/llmstat
+
+Windows (PowerShell):
+
+```powershell
+powershell -c "irm https://github.com/lexoliu/llmstat/releases/latest/download/llmstat-installer.ps1 | iex"
+```
+
+Or grab a platform archive directly from
+[Releases](https://github.com/lexoliu/llmstat/releases/latest)
+(`aarch64`/`x86_64` macOS, `aarch64`/`x86_64` Linux gnu + musl,
+`x86_64` Windows) — each has a `.sha256` next to it.
+
+From source via crates.io:
+
+```sh
+cargo install llmstat
 ```
 
 ## Usage
@@ -26,7 +49,7 @@ and shows tokens/s per source over the last 10 minutes plus a per-session
 table. Sessions show their human-readable name (task title, slug, or first
 prompt) — click the SESSION cell to toggle a row to its canonical id. Click a
 column header to sort (rate desc, then last activity, by default); clickable
-elements underline on hover. Tokens
+elements brighten on hover. Tokens
 appear when each API call completes — that is when the CLIs write usage to
 disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
