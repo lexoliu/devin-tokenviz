@@ -6,9 +6,12 @@ mod sources;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::pricing::PriceBook;
 use crate::render::Pal;
@@ -111,8 +114,6 @@ fn main() -> anyhow::Result<()> {
     if let Some(p) = &args.pricing {
         rules.extend(pricing::load_rules(p)?);
     }
-    let litellm = pricing::litellm::LiteBook::load(args.refresh_prices);
-    let book = PriceBook::new(rules, litellm);
 
     // Resolve which sources to read. An explicitly named source errors when
     // its data is missing; an auto-detected one is skipped silently.
@@ -194,7 +195,35 @@ fn main() -> anyhow::Result<()> {
     let mut calls = Vec::new();
     let mut coverage = Vec::new();
     let mut warnings = Vec::new();
-    std::thread::scope(|s| {
+    let done = Arc::new(AtomicBool::new(false));
+    let report = std::thread::scope(|s| {
+        // Overall spinner, shown only if the whole pipeline (price fetch,
+        // source scans, aggregation) takes >400ms — a warm run finishes
+        // before the first frame and never flashes.
+        {
+            let done = done.clone();
+            let mp = &mp;
+            s.spawn(move || {
+                for _ in 0..20 {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                let pb = mp.add(ProgressBar::new_spinner());
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("static template"),
+                );
+                pb.set_message("scanning usage data");
+                pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+                pb.finish_and_clear();
+            });
+        }
+
+        let litellm_h = s.spawn(|| pricing::litellm::LiteBook::load(args.refresh_prices));
         let handles: Vec<_> = jobs
             .into_iter()
             .filter(|(name, present, _)| wanted.contains(*name) && (*present || explicit))
@@ -215,16 +244,20 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => warnings.push(format!("{name} source panicked")),
             }
         }
-    });
+        let litellm = litellm_h.join().expect("litellm price load panicked");
+        let book = PriceBook::new(rules, litellm);
 
-    coverage.push(format!("prices: {}", book.source_note));
-    if calls.is_empty() {
-        warnings.push("no usage data found".to_string());
-    }
-    let t0 = std::time::Instant::now();
-    let n_calls = calls.len();
-    let report = report::build(calls, &book, since, bucket, coverage, warnings);
-    tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
+        coverage.push(format!("prices: {}", book.source_note));
+        if calls.is_empty() {
+            warnings.push("no usage data found".to_string());
+        }
+        let t0 = std::time::Instant::now();
+        let n_calls = calls.len();
+        let report = report::build(calls, &book, since, bucket, coverage, warnings);
+        tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
+        done.store(true, Ordering::Relaxed);
+        report
+    });
     print!("{}", render::render(&report, desc, Pal::detect()));
     Ok(())
 }
