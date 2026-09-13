@@ -1,0 +1,7 @@
+[workspace]
+# git tag v{version} — the tag push triggers the cargo-dist release.yml.
+git_tag_enable = true
+# The GitHub Release itself is created by cargo-dist so it can attach
+# binaries and install instructions.
+git_release_enable = false
+changelog_update = true
