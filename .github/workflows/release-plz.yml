@@ -6,18 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  # crates.io publish + git tag when Cargo.toml's version is unpublished.
-  # Runs under RELEASE_TOKEN (PAT) so the pushed tag cascades into the
-  # cargo-dist `release.yml` build — GITHUB_TOKEN never triggers other
-  # workflows. crates.io auth is OIDC trusted publishing (no stored token).
+  # Pushes git tag v{version} when Cargo.toml's version is unpublished.
+  # The tag (pushed under the RELEASE_TOKEN PAT) cascades into the
+  # tag-triggered release.yml, which does the crates.io publish via OIDC
+  # trusted publishing plus the cargo-dist binary builds — one atomic run.
   release:
-    name: crates.io release
+    name: tag release
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
