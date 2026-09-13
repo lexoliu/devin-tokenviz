@@ -38,9 +38,9 @@ cargo install llmstat
 
 ```
 llmstat                 # all recorded history (default: `all`)
-llmstat day             # last 24 hours, hourly timeline  (alias: 24h)
-llmstat week            # last 7 days, daily timeline
-llmstat month           # last 30 days, daily timeline
+llmstat daily           # last 24 hours, hourly timeline  (alias: 24h)
+llmstat weekly          # last 7 days, daily timeline
+llmstat monthly         # last 30 days, daily timeline
 llmstat monitor         # real-time monitor: rolling tok/s chart + per-session table
 ```
 
