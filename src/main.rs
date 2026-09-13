@@ -73,11 +73,11 @@ struct Args {
 enum Cmd {
     /// Last 24 hours, per-hour timeline.
     #[command(visible_alias = "24h")]
-    Day,
+    Daily,
     /// Last 7 days, per-day timeline.
-    Week,
+    Weekly,
     /// Last 30 days, per-day timeline.
-    Month,
+    Monthly,
     /// All recorded history (default).
     All,
     /// Real-time monitor: rolling tok/s chart + per-session table (TUI).
@@ -258,17 +258,17 @@ fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_millis(interval_ms.max(200)),
             );
         }
-        Cmd::Day => (
+        Cmd::Daily => (
             "last 24h",
             Some(now - Duration::hours(24)),
             BucketKind::Hour,
         ),
-        Cmd::Week => (
+        Cmd::Weekly => (
             "last 7 days",
             Some(now - Duration::days(7)),
             BucketKind::Day,
         ),
-        Cmd::Month => (
+        Cmd::Monthly => (
             "last 30 days",
             Some(now - Duration::days(30)),
             BucketKind::Day,
