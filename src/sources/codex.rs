@@ -13,14 +13,16 @@
 
 use anyhow::Result;
 use chrono::DateTime;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::report::{Call, Usage};
 use crate::sources::SourceOut;
-use crate::sources::filecache::{self, CachedCall, Entry, Plan};
+use crate::sources::filecache::{self, CachedCall, Dict, Entry, Plan};
 
 #[derive(Deserialize)]
 struct Line {
@@ -84,16 +86,18 @@ fn session_id_of(path: &Path) -> String {
         .join("-")
 }
 
-/// (dedup key, call) pairs parsed from a file region.
-type Entries = Vec<(String, CachedCall)>;
+/// Calls parsed from a file region (dict indices into the entry's dict).
+type Entries = Vec<CachedCall>;
 
-/// Parse `path` starting at `offset` with `state`, returning
-/// (consumed bytes, final state, new tail entries).
+/// Parse `path` starting at `offset` with `state`, extending `dict`.
+/// Returns (consumed bytes, final state, dict, new tail entries).
 fn parse_file(
     path: &Path,
     offset: u64,
     mut state: State,
-) -> std::io::Result<(u64, State, Entries)> {
+    dict: Vec<String>,
+) -> std::io::Result<(u64, State, Vec<String>, Entries)> {
+    let mut dict = Dict::from_vec(dict);
     let mut entries = Vec::new();
     let consumed = filecache::read_lines(
         path,
@@ -134,39 +138,40 @@ fn parse_file(
                     // (session, instant, cumulative total) identifies one
                     // event — the same event is stored in both sessions/ and
                     // archived_sessions/
-                    let key = format!("{}:{ts}:{}", state.sid, total.total_tokens);
-                    entries.push((
+                    let total_b = total.total_tokens.to_le_bytes();
+                    let key = filecache::key_of(&[state.sid.as_bytes(), ts.as_bytes(), &total_b]);
+                    entries.push(CachedCall {
                         key,
-                        CachedCall {
-                            session: state.sid.clone(),
-                            model: state.model.clone(),
-                            ts: DateTime::parse_from_rfc3339(&ts)
-                                .ok()
-                                .map(|t| t.timestamp()),
-                            usage: Usage {
-                                input: last.input_tokens.saturating_sub(last.cached_input_tokens),
-                                cached: last.cached_input_tokens,
-                                output: last.output_tokens + last.reasoning_output_tokens,
-                            },
-                            estimated: false,
+                        session: dict.intern(&state.sid),
+                        model: dict.intern(&state.model),
+                        ts: DateTime::parse_from_rfc3339(&ts)
+                            .ok()
+                            .map(|t| t.timestamp()),
+                        usage: Usage {
+                            input: last.input_tokens.saturating_sub(last.cached_input_tokens),
+                            cached: last.cached_input_tokens,
+                            output: last.output_tokens + last.reasoning_output_tokens,
                         },
-                    ));
+                        estimated: false,
+                    });
                 }
                 _ => {}
             }
         },
     )?;
-    Ok((consumed, state, entries))
+    Ok((consumed, state, dict.into_strings(), entries))
 }
 
 enum Outcome {
     Reuse,
-    Resumed(u64, State, Entries),
-    Full(u64, State, Entries),
+    Resumed(u64, State, Vec<String>, Entries),
+    Full(u64, State, Vec<String>, Entries),
 }
 
-pub fn load(dirs: &[PathBuf]) -> Result<SourceOut> {
-    let mut cache: HashMap<PathBuf, Entry<State>> = filecache::load("codex-files");
+pub fn load(dirs: &[PathBuf], mp: &MultiProgress) -> Result<SourceOut> {
+    let t0 = std::time::Instant::now();
+    let scope: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    let mut cache: HashMap<PathBuf, Entry<State>> = filecache::load("codex-files", &scope);
 
     let mut files: Vec<(PathBuf, u64)> = Vec::new();
     for dir in dirs {
@@ -187,39 +192,86 @@ pub fn load(dirs: &[PathBuf]) -> Result<SourceOut> {
         );
     }
 
-    let results: Vec<(PathBuf, Option<Outcome>)> = files
+    // Phase 1: classify every file (stat + probe only — no parsing).
+    let planned: Vec<(PathBuf, u64, Plan<State>)> = files
         .par_iter()
         .map(|(path, len)| {
-            let fresh = || State {
-                model: "unknown".into(),
-                sid: session_id_of(path),
-            };
-            let oc = match filecache::plan(path, *len, cache.get(path)) {
-                Plan::Reuse => Some(Outcome::Reuse),
-                Plan::Resume(offset, st) => parse_file(path, offset, st)
-                    .ok()
-                    .map(|(c, s, e)| Outcome::Resumed(c, s, e)),
-                Plan::Full => parse_file(path, 0, fresh())
-                    .ok()
-                    .map(|(c, s, e)| Outcome::Full(c, s, e)),
-            };
-            (path.clone(), oc)
+            (
+                path.clone(),
+                *len,
+                filecache::plan(path, *len, cache.get(path)),
+            )
         })
         .collect();
+    let todo_bytes: u64 = planned
+        .iter()
+        .map(|(_, len, p)| filecache::plan_bytes(*len, p))
+        .sum();
+
+    // Phase 2: parse what needs parsing, with a progress bar when the work
+    // is big enough to feel (cold scans read gigabytes).
+    let pb = (todo_bytes >= filecache::BAR_MIN_BYTES).then(|| {
+        let pb = mp.add(ProgressBar::new(todo_bytes));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.cyan} {msg} {wide_bar:.cyan/blue} {bytes}/{total_bytes}",
+            )
+            .expect("static template"),
+        );
+        pb.set_message("codex: parsing rollouts");
+        pb
+    });
+    let results: Vec<(PathBuf, Option<Outcome>)> = planned
+        .into_par_iter()
+        .map(|(path, len, plan)| {
+            let (oc, done) = match plan {
+                Plan::Reuse => (Some(Outcome::Reuse), 0),
+                Plan::Resume(offset, st) => {
+                    // resumed tails keep the file's dict so indices stay valid
+                    let dict = cache.get(&path).map(|e| e.dict.clone()).unwrap_or_default();
+                    (
+                        parse_file(&path, offset, st, dict)
+                            .ok()
+                            .map(|(c, s, d, e)| Outcome::Resumed(c, s, d, e)),
+                        len - offset,
+                    )
+                }
+                Plan::Full => {
+                    let fresh = State {
+                        model: "unknown".into(),
+                        sid: session_id_of(&path),
+                    };
+                    (
+                        parse_file(&path, 0, fresh, Vec::new())
+                            .ok()
+                            .map(|(c, s, d, e)| Outcome::Full(c, s, d, e)),
+                        len,
+                    )
+                }
+            };
+            if let Some(pb) = &pb {
+                pb.inc(done);
+            }
+            (path, oc)
+        })
+        .collect();
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
 
     let mut new_cache: HashMap<PathBuf, Entry<State>> = HashMap::with_capacity(results.len());
     let mut parsed_new = 0usize;
     for (path, oc) in results {
         let Some(oc) = oc else { continue };
-        let (offset, state, mut tail, keep_old) = match oc {
+        let (offset, state, mut dict, mut tail, keep_old) = match oc {
             Outcome::Reuse => {
                 if let Some(e) = cache.remove(&path) {
                     new_cache.insert(path, e);
                 }
                 continue;
             }
-            Outcome::Resumed(o, s, t) => (o, s, t, true),
-            Outcome::Full(o, s, t) => (o, s, t, false),
+            Outcome::Resumed(o, s, d, t) => (o, s, d, t, true),
+            Outcome::Full(o, s, d, t) => (o, s, d, t, false),
         };
         let mut entries = if keep_old {
             cache.remove(&path).map(|e| e.entries).unwrap_or_default()
@@ -230,10 +282,19 @@ pub fn load(dirs: &[PathBuf]) -> Result<SourceOut> {
         entries.append(&mut tail);
         // token events can precede the first turn_context (truncated
         // rollouts); attribute them to the file's final model
-        if state.model != "unknown" {
-            for (_, c) in &mut entries {
-                if c.model == "unknown" {
-                    c.model = state.model.clone();
+        if state.model != "unknown"
+            && let Some(u) = dict.iter().position(|s| s == "unknown")
+        {
+            let m = match dict.iter().position(|s| s == &state.model) {
+                Some(i) => i as u32,
+                None => {
+                    dict.push(state.model.clone());
+                    (dict.len() - 1) as u32
+                }
+            };
+            for c in &mut entries {
+                if c.model == u as u32 {
+                    c.model = m;
                 }
             }
         }
@@ -244,6 +305,7 @@ pub fn load(dirs: &[PathBuf]) -> Result<SourceOut> {
                 mtime: filecache::mtime(&path),
                 boundary: filecache::boundary(&path, offset),
                 state,
+                dict,
                 entries,
             },
         );
@@ -252,25 +314,40 @@ pub fn load(dirs: &[PathBuf]) -> Result<SourceOut> {
     // rewrite the (large) cache file only when something changed —
     // leftovers in `cache` are files deleted since the last run
     if parsed_new > 0 || !cache.is_empty() {
-        filecache::save("codex-files", &new_cache);
+        filecache::save("codex-files", &scope, &new_cache);
     }
 
+    tracing::debug!(parsed_new, todo_bytes, elapsed = ?t0.elapsed(), "codex walk+parse done");
+
     // iterate in walk order — deterministic across runs
+    let t1 = std::time::Instant::now();
     let mut seen = HashSet::new();
     let mut calls: Vec<Call> = Vec::new();
     let mut dupes = 0usize;
+    let mut total_entries = 0usize;
     for (path, _) in &files {
         let Some(e) = new_cache.get(path) else {
             continue;
         };
-        for (key, c) in &e.entries {
-            if seen.insert(key.clone()) {
-                calls.push(c.to_call("codex"));
+        let dict: Vec<Arc<str>> = e.dict.iter().map(|s| s.as_str().into()).collect();
+        for c in &e.entries {
+            total_entries += 1;
+            if seen.insert(c.key) {
+                calls.push(c.to_call("codex", &dict));
             } else {
                 dupes += 1;
             }
         }
     }
+    tracing::debug!(
+        files = files.len(),
+        parsed_new,
+        total_entries,
+        calls = calls.len(),
+        merge = ?t1.elapsed(),
+        elapsed = ?t0.elapsed(),
+        "codex source"
+    );
 
     let mut note = format!(
         "codex: {} rollout files · {parsed_new} reparsed",

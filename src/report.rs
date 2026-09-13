@@ -2,9 +2,10 @@
 //! usage; `build()` folds calls into the per-model/session/timeline `Report`.
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use crate::pricing::{Price, PriceBook, Pricing};
+use crate::pricing::{Price, PriceBook, Pricing, Resolved};
 
 /// Token usage for a single call or aggregate. `input` is the *uncached*
 /// portion of prompt tokens; `cached` is the cache-hit subset.
@@ -34,14 +35,15 @@ impl Usage {
     }
 }
 
-/// One model call emitted by a source.
+/// One model call emitted by a source. Session/model are `Arc<str>` — the
+/// file cache interns them per file, so rehydration is a refcount bump.
 pub struct Call {
     /// Which CLI produced it: "devin" | "claude" | "codex".
     pub source: &'static str,
     /// Session identifier within that source.
-    pub session: String,
+    pub session: Arc<str>,
     /// Raw model name as recorded by the CLI.
-    pub model: String,
+    pub model: Arc<str>,
     pub ts: Option<DateTime<Utc>>,
     pub usage: Usage,
     /// Token split was estimated (e.g. db-recovered calls only record the
@@ -81,7 +83,7 @@ pub struct Session {
     pub usage: Usage,
     pub steps: usize,
     /// (source, model label) -> usage within this session.
-    pub models: BTreeMap<(&'static str, String), Usage>,
+    pub models: BTreeMap<(&'static str, Arc<str>), Usage>,
     pub list_cost: f64,
     pub actual_cost: f64,
     pub has_unpriced: bool,
@@ -151,12 +153,17 @@ pub fn build(
         latest: None,
         has_estimated: false,
     };
-    // (source, label) -> index into report.models
-    let mut model_idx: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
+    // (source, model label) -> index into report.models
+    let mut model_idx: BTreeMap<(&'static str, Arc<str>), usize> = BTreeMap::new();
     // (source, session) -> Session
-    let mut sessions: BTreeMap<(&'static str, String), Session> = BTreeMap::new();
+    let mut sessions: BTreeMap<(&'static str, Arc<str>), Session> = BTreeMap::new();
     let mut day_buckets: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
     let mut hour_buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+    // raw model -> resolved pricing; model names repeat massively across
+    // calls, so resolve once per distinct name instead of per call
+    let mut resolved_list: Vec<Resolved> = Vec::new();
+    let mut label_arc: Vec<Arc<str>> = Vec::new();
+    let mut resolve_idx: HashMap<Arc<str>, usize> = HashMap::new();
 
     for ev in calls {
         if let (Some(c), Some(t)) = (since, ev.ts)
@@ -166,11 +173,19 @@ pub fn build(
         }
         report.has_estimated |= ev.estimated;
         let usage = ev.usage;
-        let resolved = book.resolve(&ev.model);
+        let ridx = *resolve_idx.entry(ev.model.clone()).or_insert_with(|| {
+            let r = book.resolve(&ev.model);
+            label_arc.push(r.label.as_str().into());
+            resolved_list.push(r);
+            resolved_list.len() - 1
+        });
+        let resolved = &resolved_list[ridx];
         let step_cost = resolved.price.as_ref().map(|p| usage.cost(p));
         let step_paid = matches!(resolved.pricing, Pricing::Paid);
 
-        let key = (ev.source, resolved.label.clone());
+        // distinct raw names can share a label ("swe-2-max", "SWE-2 Max") —
+        // group by label, not by resolved index
+        let key = (ev.source, label_arc[ridx].clone());
         let idx = *model_idx.entry(key).or_insert_with(|| {
             report.models.push(ModelStat {
                 source: ev.source,
@@ -186,8 +201,8 @@ pub fn build(
             report.models.len() - 1
         });
         let stat = &mut report.models[idx];
-        if !stat.raw_names.iter().any(|n| n == &ev.model) {
-            stat.raw_names.push(ev.model.clone());
+        if !stat.raw_names.iter().any(|n| n.as_str() == &*ev.model) {
+            stat.raw_names.push(ev.model.to_string());
         }
         stat.usage.add(&usage);
         stat.steps += 1;
@@ -205,7 +220,7 @@ pub fn build(
         });
         session
             .models
-            .entry((ev.source, resolved.label.clone()))
+            .entry((ev.source, label_arc[ridx].clone()))
             .or_default()
             .add(&usage);
         session.usage.add(&usage);

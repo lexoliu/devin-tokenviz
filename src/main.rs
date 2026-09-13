@@ -145,19 +145,22 @@ fn main() -> anyhow::Result<()> {
     });
     let codex_dirs = sources::codex::dirs_for(&codex_root);
 
-    // The three scans are independent — run them concurrently.
-    type Job = (
+    // The three scans are independent — run them concurrently under one
+    // MultiProgress so their progress bars stack instead of clobbering.
+    let mp = indicatif::MultiProgress::new();
+    type Job<'a> = (
         &'static str,
         bool,
-        Box<dyn FnOnce() -> anyhow::Result<SourceOut> + Send>,
+        Box<dyn FnOnce() -> anyhow::Result<SourceOut> + Send + 'a>,
     );
-    let jobs: Vec<Job> = {
+    let jobs: Vec<Job<'_>> = {
         let devin_dir = devin_dir.clone();
         let args_db = args.devin_db.clone();
         let transcripts_only = args.devin_transcripts_only;
         let claude_dir = claude_dir.clone();
         let codex_dirs = codex_dirs.clone();
         let codex_present = codex_dirs.iter().any(|d| d.exists());
+        let mp = &mp;
         vec![
             (
                 "devin",
@@ -172,18 +175,18 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or_else(sources::devin::default_db_path),
                         )
                     };
-                    sources::devin::load(&devin_dir, db.as_deref().filter(|p| p.exists()))
+                    sources::devin::load(&devin_dir, db.as_deref().filter(|p| p.exists()), mp)
                 }) as _,
             ),
             (
                 "claude",
                 claude_dir.exists(),
-                Box::new(move || sources::claude::load(&claude_dir)) as _,
+                Box::new(move || sources::claude::load(&claude_dir, mp)) as _,
             ),
             (
                 "codex",
                 codex_present,
-                Box::new(move || sources::codex::load(&codex_dirs)) as _,
+                Box::new(move || sources::codex::load(&codex_dirs, mp)) as _,
             ),
         ]
     };
@@ -218,7 +221,10 @@ fn main() -> anyhow::Result<()> {
     if calls.is_empty() {
         warnings.push("no usage data found".to_string());
     }
+    let t0 = std::time::Instant::now();
+    let n_calls = calls.len();
     let report = report::build(calls, &book, since, bucket, coverage, warnings);
+    tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
     print!("{}", render::render(&report, desc, Pal::detect()));
     Ok(())
 }

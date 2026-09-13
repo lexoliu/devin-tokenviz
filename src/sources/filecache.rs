@@ -13,18 +13,71 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::report::{Call, Usage};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const PROBE: usize = 64;
 
+/// 128-bit dedup key. Sources hash their identifying parts — a false
+/// collision would drop a real call, so 64 bits is not enough.
+pub fn key_of(parts: &[&[u8]]) -> u128 {
+    let mut h = Xxh3::new();
+    for p in parts {
+        // length prefix keeps tuple boundaries unambiguous
+        h.update(&(p.len() as u32).to_le_bytes());
+        h.update(p);
+    }
+    h.digest128()
+}
+
+/// Per-file string table: session/model names repeat per call, so entries
+/// store u32 indices into this instead of copies.
+#[derive(Default)]
+pub struct Dict {
+    strings: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl Dict {
+    /// Rebuild a Dict from a cached `Entry.dict` so resumed parses keep
+    /// existing indices stable.
+    pub fn from_vec(strings: Vec<String>) -> Self {
+        let index = strings
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Self { strings, index }
+    }
+
+    pub fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.index.get(s) {
+            return i;
+        }
+        let i = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), i);
+        i
+    }
+
+    pub fn into_strings(self) -> Vec<String> {
+        self.strings
+    }
+}
+
 /// Serializable form of `Call` (`Call.source` is `&'static str`, set by the
-/// owning source on rehydration).
+/// owning source on rehydration; `session`/`model` index the entry's dict).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCall {
-    pub session: String,
-    pub model: String,
+    /// xxh3-128 dedup key (see `key_of`).
+    pub key: u128,
+    /// Index into `Entry::dict`.
+    pub session: u32,
+    /// Index into `Entry::dict`.
+    pub model: u32,
     /// unix seconds
     pub ts: Option<i64>,
     pub usage: Usage,
@@ -32,11 +85,11 @@ pub struct CachedCall {
 }
 
 impl CachedCall {
-    pub fn to_call(&self, source: &'static str) -> Call {
+    pub fn to_call(&self, source: &'static str, dict: &[Arc<str>]) -> Call {
         Call {
             source,
-            session: self.session.clone(),
-            model: self.model.clone(),
+            session: dict[self.session as usize].clone(),
+            model: dict[self.model as usize].clone(),
             ts: self.ts.and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
             usage: self.usage,
             estimated: self.estimated,
@@ -55,8 +108,10 @@ pub struct Entry<S> {
     /// Up to `PROBE` bytes ending at `offset` — append-safety probe.
     pub boundary: Vec<u8>,
     pub state: S,
-    /// (dedup key, call) pairs parsed from the file.
-    pub entries: Vec<(String, CachedCall)>,
+    /// String table that `CachedCall.session`/`model` index into.
+    pub dict: Vec<String>,
+    /// Calls parsed from the file.
+    pub entries: Vec<CachedCall>,
 }
 
 #[derive(Serialize)]
@@ -72,24 +127,36 @@ struct CacheFileRead<S> {
     files: HashMap<PathBuf, Entry<S>>,
 }
 
-fn cache_path(name: &str) -> PathBuf {
+/// The cache is scoped to the directory set being scanned — a `--*-dir`
+/// override must not read or clobber the default location's cache.
+fn cache_path(name: &str, scope: &[&Path]) -> PathBuf {
+    let mut h = Xxh3::new();
+    for p in scope {
+        let s = p.to_string_lossy();
+        h.update(&(s.len() as u32).to_le_bytes());
+        h.update(s.as_bytes());
+    }
     std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
-        .join(format!(".cache/llmstat/{name}.bin"))
+        .join(format!(".cache/llmstat/{name}-{:032x}.bin", h.digest128()))
 }
 
-pub fn load<S: DeserializeOwned>(name: &str) -> HashMap<PathBuf, Entry<S>> {
-    let Ok(bytes) = std::fs::read(cache_path(name)) else {
+pub fn load<S: DeserializeOwned>(name: &str, scope: &[&Path]) -> HashMap<PathBuf, Entry<S>> {
+    let t0 = std::time::Instant::now();
+    let Ok(bytes) = std::fs::read(cache_path(name, scope)) else {
         return HashMap::new();
     };
-    match bincode::deserialize::<CacheFileRead<S>>(&bytes) {
+    let n = bytes.len();
+    let out = match bincode::deserialize::<CacheFileRead<S>>(&bytes) {
         Ok(c) if c.version == VERSION => c.files,
         _ => HashMap::new(),
-    }
+    };
+    tracing::debug!(name, bytes = n, files = out.len(), elapsed = ?t0.elapsed(), "filecache load");
+    out
 }
 
-pub fn save<S: Serialize>(name: &str, files: &HashMap<PathBuf, Entry<S>>) {
-    let file = cache_path(name);
+pub fn save<S: Serialize>(name: &str, scope: &[&Path], files: &HashMap<PathBuf, Entry<S>>) {
+    let file = cache_path(name, scope);
     if let Some(dir) = file.parent()
         && std::fs::create_dir_all(dir).is_err()
     {
@@ -102,6 +169,12 @@ pub fn save<S: Serialize>(name: &str, files: &HashMap<PathBuf, Entry<S>>) {
     let Ok(bytes) = bincode::serialize(&c) else {
         return;
     };
+    tracing::debug!(
+        name,
+        bytes = bytes.len(),
+        files = files.len(),
+        "filecache save"
+    );
     let tmp = file.with_extension("tmp");
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(tmp, file);
@@ -118,6 +191,19 @@ pub enum Plan<S> {
     /// New, shrunk, rewritten, or unverifiable — parse from byte 0.
     Full,
 }
+
+/// Bytes a `Plan` will read — drives the progress-bar threshold.
+pub fn plan_bytes<S>(len: u64, p: &Plan<S>) -> u64 {
+    match p {
+        Plan::Reuse => 0,
+        Plan::Resume(o, _) => len - o,
+        Plan::Full => len,
+    }
+}
+
+/// Show a parse progress bar only above this much fresh input — below it the
+/// scan finishes before a human can read the bar anyway.
+pub const BAR_MIN_BYTES: u64 = 32 << 20;
 
 pub fn mtime(path: &Path) -> i64 {
     std::fs::metadata(path)
