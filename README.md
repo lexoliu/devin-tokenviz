@@ -1,11 +1,35 @@
+<div align="center">
+
 # llmstat
 
-Token usage distribution and cost across local LLM CLIs — one report over
-**Devin CLI**, **Claude Code**, and **Codex CLI**, priced with the LiteLLM
-pricebook.
+**Token usage and cost across your local LLM CLIs — one report.**
 
-Pure Rust. Reports print and exit; `monitor` is a live TUI.
-Colors/ANSI only on a TTY; respects `NO_COLOR`.
+[![crates.io](https://img.shields.io/crates/v/llmstat)](https://crates.io/crates/llmstat)
+[![release](https://img.shields.io/github/v/release/lexoliu/llmstat)](https://github.com/lexoliu/llmstat/releases/latest)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+Devin CLI · Claude Code · Codex CLI — priced with the LiteLLM pricebook, in pure Rust.
+
+<img src="assets/monitor.png" width="860" alt="llmstat monitor — rolling tokens/s chart over a live per-session table">
+
+</div>
+
+## Features
+
+- **Unified usage reports** — one table across Devin, Claude Code, and Codex:
+  tokens in/cached/out, calls, share, and cost per model
+- **Honest pricing for free models** — SWE-2, Adaptive & co. are priced at
+  their public equivalents (Kimi K3, …); the list price is struck through and
+  the real **$0.00** shows in green
+- **Live monitor** — rolling tokens/s chart + per-session table, mouse-sortable
+  columns, click a session to reveal its id
+- **Energy trivia** — every report estimates the kWh behind your tokens and
+  prices them at the US industrial rate
+- **Fast on huge logs** — incremental caches everywhere; Devin's multi-GB
+  SQLite scans only the new tail after the first run
+
+Reports print and exit; `monitor` is a live TUI. Colors only on a TTY,
+respects `NO_COLOR`.
 
 ## Install
 
@@ -49,9 +73,8 @@ and shows tokens/s per source over the last 10 minutes plus a per-session
 table. Sessions show their human-readable name (task title, slug, or first
 prompt) — click the SESSION cell to toggle a row to its canonical id. Click a
 column header to sort (rate desc, then last activity, by default); clickable
-elements brighten on hover. Tokens
-appear when each API call completes — that is when the CLIs write usage to
-disk. Quit with `q`, `Esc`, or `Ctrl-C`.
+elements brighten on hover. Tokens appear when each API call completes — that
+is when the CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
 ```
 llmstat --sources devin,claude      # read only these sources
@@ -67,7 +90,7 @@ llmstat --refresh-prices            # re-fetch the LiteLLM pricebook
 Without `--sources`, every source whose data directory exists is read; the
 three scans run concurrently.
 
-## Sample output (day)
+## Sample output (daily)
 
 ```
 llmstat · last 24h · Sep 11 19:18 → Sep 12 19:18
