@@ -10,11 +10,13 @@ pub mod db;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use indicatif::MultiProgress;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::fmt;
 use crate::report::{Call, Usage};
@@ -57,7 +59,7 @@ pub fn default_db_path() -> PathBuf {
 
 /// Scan `dir` for transcript JSONs, then recover extra calls from `db_path`
 /// (sessions.db) unless it is None.
-pub fn load(dir: &Path, db_path: Option<&Path>) -> Result<SourceOut> {
+pub fn load(dir: &Path, db_path: Option<&Path>, mp: &MultiProgress) -> Result<SourceOut> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("cannot read transcript dir {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -131,8 +133,8 @@ pub fn load(dir: &Path, db_path: Option<&Path>) -> Result<SourceOut> {
             }
             calls.push(Call {
                 source: "devin",
-                session: name.clone(),
-                model: raw_model.clone(),
+                session: name.as_str().into(),
+                model: raw_model.as_str().into(),
                 ts,
                 usage: Usage {
                     input: m.prompt_tokens - cached,
@@ -148,7 +150,7 @@ pub fn load(dir: &Path, db_path: Option<&Path>) -> Result<SourceOut> {
     let mut recovered_calls = 0usize;
     let mut recovered_tokens = 0u64;
     let db_ok = if let Some(p) = db_path {
-        match db::load(p) {
+        match db::load(p, mp) {
             Ok(d) => {
                 let g_ratio = if g_prompt > 0 {
                     (
@@ -191,8 +193,8 @@ pub fn load(dir: &Path, db_path: Option<&Path>) -> Result<SourceOut> {
                     recovered_tokens += call.prompt;
                     calls.push(Call {
                         source: "devin",
-                        session: call.session,
-                        model,
+                        session: Arc::from(call.session.as_str()),
+                        model: model.into(),
                         ts: DateTime::from_timestamp(call.ts, 0),
                         usage: Usage {
                             input: call.prompt - cached,

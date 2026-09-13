@@ -71,6 +71,11 @@ Devin's sessions.db is multi-GB and insert-only; matched rows are cached in
 range scans over several read-only connections, with a sequential prefetch
 warming the OS page cache. First run ~3s, later runs ~0.1s.
 
+Claude and Codex logs are append-only JSONL; parsed calls are cached per
+file (offset + append-probe + parser state, xxh3-128 dedup keys, interned
+session/model strings) in `~/.cache/llmstat/<source>-files-<dirhash>.bin`,
+so later runs reparse only appended tails — full history ~0.35s warm.
+
 ## Pricing
 
 Base prices come from LiteLLM's
