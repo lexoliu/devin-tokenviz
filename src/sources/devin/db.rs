@@ -11,7 +11,7 @@
 //! scans just the `row_id` tail beyond the cached high-water mark.
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -126,7 +126,7 @@ fn workers() -> usize {
         .max(1)
 }
 
-pub fn load(path: &Path) -> Result<DbData> {
+pub fn load(path: &Path, mp: &MultiProgress) -> Result<DbData> {
     let conn = open(path)?;
 
     let mut session_models = HashMap::new();
@@ -167,7 +167,7 @@ pub fn load(path: &Path) -> Result<DbData> {
         // Only worth a spinner for a real (multi-second) scan; a cache-hit
         // tail finishes before the first frame would draw.
         let pb = (span >= 50_000).then(|| {
-            let pb = ProgressBar::new_spinner();
+            let pb = mp.add(ProgressBar::new_spinner());
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("static template"),
             );
