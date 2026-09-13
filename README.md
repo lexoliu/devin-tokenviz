@@ -127,6 +127,37 @@ output = 8.0           # USD per 1M output tokens
 
 User rules take precedence over built-ins and LiteLLM.
 
+## Energy ("did you know")
+
+Every report footer estimates the **serving energy** behind your tokens,
+shows 2–3 everyday equivalences, and prices the electricity at the US
+industrial rate ($0.081/kWh, EIA). Order-of-magnitude only — real serving
+energy swings several-fold with batch utilization.
+
+Per-model J/token, two paths:
+
+1. **Known architectures** — `J/token = P_active[B] / 100`
+   (`2 × active params` FLOPs/token ÷ ~200 GFLOP/J datacenter-effective:
+   H100 BF16, ~30% MFU, node overhead, PUE 1.15). Params come from the
+   upstream model card; post-trained models inherit their base (SWE-2 →
+   Kimi K3 = 104B activated). The pricing `as` alias chain is followed.
+2. **Unknown-parameter models** — list-price inversion. Energy is ~3–5%
+   of serving cost, so price implies GPU-slot-seconds/token, which
+   converts to energy directly: `J/token = price_$/Mtok × 3 × (1 − margin)`
+   with `margin = 0.5` assumed. Input/output are inverted separately.
+
+Cache-read tokens are counted at zero (their prefill was already billed
+as input when it ran).
+
+```toml
+[energy]
+margin = 0.5            # gross margin assumed in price inversion
+
+[[param]]
+pattern = "my-model"    # normalized substring, like [[rule]]
+active_b = 32.0         # activated parameters in billions
+```
+
 ## Notes
 
 - Recovered calls show exact input tokens; the cached/output split is
