@@ -1,39 +1,30 @@
-<div align="center">
-
 # llmstat
-
-**Token usage and cost across your local LLM CLIs — one report.**
 
 [![crates.io](https://img.shields.io/crates/v/llmstat)](https://crates.io/crates/llmstat)
 [![release](https://img.shields.io/github/v/release/lexoliu/llmstat)](https://github.com/lexoliu/llmstat/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Devin CLI · Claude Code · Codex CLI — priced with the LiteLLM pricebook, in pure Rust.
+Token usage and cost reports for local LLM CLIs: Devin CLI, Claude Code, and
+Codex CLI. Prices come from the LiteLLM pricebook. Pure Rust.
 
-<img src="assets/monitor.png" width="860" alt="llmstat monitor — rolling tokens/s chart over a live per-session table">
+<img src="assets/monitor.png" width="860" alt="llmstat monitor — rolling tokens/s chart over a per-session table">
 
-</div>
+- Per-model totals: input / cache-read / output tokens, calls, share, cost
+- Free CLI models are still priced at a public equivalent (SWE-2 → kimi-k3):
+  the list price is struck through and the actual $0.00 is shown in green
+- `monitor` is a live TUI: rolling tokens/s chart plus a per-session table;
+  click a column header to sort, click a session name to reveal its id
+- Each report estimates the energy behind the tokens (kWh and cost at the
+  US industrial electricity rate)
+- All sources are cached incrementally; repeat runs only parse appended data
 
-## Features
-
-- **Unified usage reports** — one table across Devin, Claude Code, and Codex:
-  tokens in/cached/out, calls, share, and cost per model
-- **Honest pricing for free models** — SWE-2, Adaptive & co. are priced at
-  their public equivalents (Kimi K3, …); the list price is struck through and
-  the real **$0.00** shows in green
-- **Live monitor** — rolling tokens/s chart + per-session table, mouse-sortable
-  columns, click a session to reveal its id
-- **Energy trivia** — every report estimates the kWh behind your tokens and
-  prices them at the US industrial rate
-- **Fast on huge logs** — incremental caches everywhere; Devin's multi-GB
-  SQLite scans only the new tail after the first run
-
-Reports print and exit; `monitor` is a live TUI. Colors only on a TTY,
-respects `NO_COLOR`.
+Reports print to stdout and exit. Colors are used only on a TTY and respect
+`NO_COLOR`.
 
 ## Install
 
-Prebuilt binaries ship with every GitHub Release — no Rust toolchain needed.
+Prebuilt binaries are attached to every GitHub Release — no Rust toolchain
+needed.
 
 macOS / Linux:
 
@@ -47,10 +38,10 @@ Windows (PowerShell):
 powershell -c "irm https://github.com/lexoliu/llmstat/releases/latest/download/llmstat-installer.ps1 | iex"
 ```
 
-Or grab a platform archive directly from
+Or download a platform archive from
 [Releases](https://github.com/lexoliu/llmstat/releases/latest)
 (`aarch64`/`x86_64` macOS, `aarch64`/`x86_64` Linux gnu + musl,
-`x86_64` Windows) — each has a `.sha256` next to it.
+`x86_64` Windows). Each archive ships with a `.sha256`.
 
 From source via crates.io:
 
@@ -70,11 +61,11 @@ llmstat monitor         # real-time monitor: rolling tok/s chart + per-session t
 
 `monitor` polls the append-only logs (default 1s, `--interval-ms` floor 200ms)
 and shows tokens/s per source over the last 10 minutes plus a per-session
-table. Sessions show their human-readable name (task title, slug, or first
-prompt) — click the SESSION cell to toggle a row to its canonical id. Click a
-column header to sort (rate desc, then last activity, by default); clickable
-elements brighten on hover. Tokens appear when each API call completes — that
-is when the CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
+table. Sessions display a human-readable name (task title, slug, or first
+prompt); clicking the SESSION cell toggles that row to its canonical id.
+Clicking a column header sorts the table — default is rate descending, then
+last activity. Tokens appear when an API call completes, which is when the
+CLIs write usage to disk. Quit with `q`, `Esc`, or `Ctrl-C`.
 
 ```
 llmstat --sources devin,claude      # read only these sources
@@ -109,28 +100,9 @@ list (equiv.) $928.61   actual $185.09   · some models unpriced
  ...
 ```
 
-- `list` = what the usage would cost at public list price
-- `actual` = what the CLI actually charges — **$0.00 in green** for models
-  the CLI offers free (their list price is struck through), red for real spend
-- `*` marks free-in-CLI models; `?` means no price could be found
-
-## Data sources
-
-| Source | Files | Notes |
-|---|---|---|
-| **Devin CLI** | `~/.local/share/devin/cli/transcripts/*.json` + `sessions.db` | transcripts only serialize the *current* chain; the db additionally recovers calls from resumed/compact/forked chains and subagent sessions that never get a transcript. Every message node's `metadata.num_tokens_preceding` equals the exact `prompt_tokens` of its inference call (verified against `response_dimensions`). Recovered calls get exact input tokens; cached/output are split at that session's observed ratio and flagged as estimated. |
-| **Claude Code** | `~/.claude/projects/**/*.jsonl` | `type:"assistant"` records carry `message.model` + `usage`. Cache-write tokens count as input; `cache_read` is the discounted part. Responses are deduped globally by `message.id` + `requestId` — Claude copies history into new transcript files on resume/compact. |
-| **Codex CLI** | `~/.codex/sessions/**`, `~/.codex/archived_sessions/` | `event_msg`/`token_count` payloads carry per-call `last_token_usage` (input / cached input / output / reasoning output). Model comes from `turn_context`/`session_meta`. Events are deduped by `(session, timestamp, cumulative total)` — the same event lives in both directories. |
-
-Devin's sessions.db is multi-GB and insert-only; matched rows are cached in
-`~/.cache/llmstat/` and each run scans only the new `row_id` tail — parallel
-range scans over several read-only connections, with a sequential prefetch
-warming the OS page cache. First run ~3s, later runs ~0.1s.
-
-Claude and Codex logs are append-only JSONL; parsed calls are cached per
-file (offset + append-probe + parser state, xxh3-128 dedup keys, interned
-session/model strings) in `~/.cache/llmstat/<source>-files-<dirhash>.bin`,
-so later runs reparse only appended tails — full history ~0.35s warm.
+- `list` is what the usage would cost at public list price; `actual` is what
+  the CLI charges — $0.00 in green for models the CLI offers free
+- `*` marks free-in-CLI models; `?` means no price was found
 
 ## Pricing
 
@@ -140,8 +112,7 @@ fetched once and cached for 24h in `~/.cache/llmstat/` (a stale cache is used
 offline). Model names are normalized and matched by exact key, then by `-`
 -delimited prefix.
 
-Rules layer on top of LiteLLM for semantics it can't express — free-in-CLI
-models priced at an equivalent public model:
+Built-in rules price free-in-CLI models at an equivalent public model:
 
 | Model | Priced as | Status |
 |---|---|---|
@@ -175,22 +146,22 @@ User rules take precedence over built-ins and LiteLLM.
 
 ## Energy ("did you know")
 
-Every report footer estimates the **serving energy** behind your tokens,
-shows 2–3 everyday equivalences, and prices the electricity at the US
-industrial rate ($0.081/kWh, EIA). Order-of-magnitude only — real serving
+Every report footer estimates the serving energy behind the tokens, shows
+2–3 everyday equivalences, and prices the electricity at the US industrial
+rate ($0.081/kWh, EIA). This is an order-of-magnitude estimate — real serving
 energy swings several-fold with batch utilization.
 
 Per-model J/token, two paths:
 
 1. **Known architectures** — `J/token = P_active[B] / 100`
    (`2 × active params` FLOPs/token ÷ ~200 GFLOP/J datacenter-effective:
-   H100 BF16, ~30% MFU, node overhead, PUE 1.15). Params come from the
+   H100 BF16, ~30% MFU, node overhead, PUE 1.15). Parameters come from the
    upstream model card; post-trained models inherit their base (SWE-2 →
    Kimi K3 = 104B activated). The pricing `as` alias chain is followed.
 2. **Unknown-parameter models** — list-price inversion. Energy is ~3–5%
    of serving cost, so price implies GPU-slot-seconds/token, which
    converts to energy directly: `J/token = price_$/Mtok × 3 × (1 − margin)`
-   with `margin = 0.5` assumed. Input/output are inverted separately.
+   with `margin = 0.5` assumed. Input and output are inverted separately.
 
 Cache-read tokens are counted at zero (their prefill was already billed
 as input when it ran).
@@ -206,7 +177,7 @@ active_b = 32.0         # activated parameters in billions
 
 ## Notes
 
-- Recovered calls show exact input tokens; the cached/output split is
+- Recovered Devin calls show exact input tokens; the cached/output split is
   estimated and marked in the output.
 - Models with no matching price are shown as `?` and excluded from totals.
 - Devin's db scan assumes `message_nodes` is append-only (`row_id`
