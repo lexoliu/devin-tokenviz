@@ -2,7 +2,8 @@ name: Publish to crates.io
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -13,8 +14,28 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      - id: version
+        run: |
+          META=$(cargo metadata --no-deps --format-version 1)
+          NAME=$(jq -r '.packages[0].name' <<<"$META")
+          VERSION=$(jq -r '.packages[0].version' <<<"$META")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          case ${#NAME} in
+            1) IDX="1/$NAME" ;;
+            2) IDX="2/$NAME" ;;
+            3) IDX="3/${NAME:1:1}/$NAME" ;;
+            *) IDX="${NAME:0:2}/${NAME:2:2}/$NAME" ;;
+          esac
+          if curl -fsSL "https://index.crates.io/$IDX" | grep -Fq "\"vers\":\"$VERSION\""; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME $VERSION is already on crates.io — skipping publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.version.outputs.exists == 'false'
         id: auth
       - run: cargo publish
+        if: steps.version.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
