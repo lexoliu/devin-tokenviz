@@ -1,0 +1,50 @@
+name: release-plz
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  # crates.io publish + git tag when Cargo.toml's version is unpublished.
+  # Runs under RELEASE_TOKEN (PAT) so the pushed tag cascades into the
+  # cargo-dist `release.yml` build — GITHUB_TOKEN never triggers other
+  # workflows. crates.io auth is OIDC trusted publishing (no stored token).
+  release:
+    name: crates.io release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  # Keeps a version-bump + changelog PR open against dev; version truth
+  # stays on the development branch.
+  release-pr:
+    name: release PR
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
