@@ -1,3 +1,4 @@
+mod energy;
 mod fmt;
 mod monitor;
 mod pricing;
@@ -184,7 +185,7 @@ fn spawn_overall_spinner<'scope, 'env>(
 /// usual progress UX, then hand off to the TUI loop.
 fn run_monitor(args: &Args, interval: std::time::Duration) -> anyhow::Result<()> {
     let src = resolve_sources(args)?;
-    let mut rules = pricing::load_default_rules();
+    let (mut rules, _) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
         rules.extend(pricing::load_rules(p)?);
     }
@@ -275,9 +276,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::All => ("all time", None, BucketKind::Auto),
     };
 
-    let mut rules = pricing::load_default_rules();
+    let (mut rules, mut energy_cfg) = pricing::load_default_config();
     if let Some(p) = &args.pricing {
-        rules.extend(pricing::load_rules(p)?);
+        let (extra, e) = pricing::load_config(p)?;
+        rules.extend(extra);
+        energy_cfg.params.extend(e.params);
+        if e.margin != energy::Energy::default().margin {
+            energy_cfg.margin = e.margin;
+        }
     }
     let src = resolve_sources(&args)?;
     let (wanted, explicit) = (&src.wanted, src.explicit);
@@ -355,7 +361,7 @@ fn main() -> anyhow::Result<()> {
         }
         let t0 = std::time::Instant::now();
         let n_calls = calls.len();
-        let report = report::build(calls, &book, since, bucket, coverage, warnings);
+        let report = report::build(calls, &book, &energy_cfg, since, bucket, coverage, warnings);
         tracing::debug!(n_calls, elapsed = ?t0.elapsed(), "report build");
         done.store(true, Ordering::Relaxed);
         report
